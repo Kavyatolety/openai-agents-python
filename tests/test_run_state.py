@@ -7,10 +7,11 @@ import importlib
 import json
 import logging
 import threading
+import uuid
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, Literal, TypeVar, cast
@@ -41,7 +42,7 @@ from openai.types.responses.response_output_item import (
 )
 from openai.types.responses.response_usage import InputTokensDetails
 from openai.types.responses.tool_param import Mcp
-from pydantic import BaseModel, ValidationError, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_serializer
 
 from agents import Agent, RunConfig, RunHooks, Runner, handoff, trace
 from agents._tool_invocation import tool_invocation_identity_and_scope
@@ -793,6 +794,144 @@ class TestRunState:
         assert context_meta["requires_deserializer"] is True
         assert context_meta["omitted"] is False
         assert any("Pydantic model" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_pydantic_context_preserves_in_place_mutated_defaults(self):
+        """In-place changes to defaulted Pydantic context fields must survive serialization.
+
+        Appending to a ``default_factory`` list or setting an attribute on a defaulted
+        nested model never marks the parent fields as set, so a dump that only includes
+        assigned fields silently drops the changes made before the run paused.
+        """
+
+        class Preferences(BaseModel):
+            channel: str = "sms"
+
+        class SupportContext(BaseModel):
+            customer_id: str
+            actions: list[str] = Field(default_factory=list)
+            preferences: Preferences = Field(default_factory=Preferences)
+
+        live_context = SupportContext(customer_id="c-1")
+        live_context.actions.append("verified identity")
+        live_context.preferences.channel = "email"
+
+        context = RunContextWrapper(context=live_context)
+        agent = Agent(name="AgentSupport")
+        state = make_state(agent, context=context, original_input="input", max_turns=1)
+
+        json_data = state.to_json()
+        assert json_data["context"]["context"] == {
+            "customer_id": "c-1",
+            "actions": ["verified identity"],
+            "preferences": {"channel": "email"},
+        }
+
+        new_state = await RunState.from_json(
+            agent,
+            json_data,
+            context_deserializer=SupportContext.model_validate,
+        )
+        assert new_state._context is not None
+        assert new_state._context.context == live_context
+
+    @pytest.mark.asyncio
+    async def test_pydantic_context_preserves_unset_generated_default(self):
+        """A generated default that was never assigned must be saved, not regenerated.
+
+        A ``default_factory`` value such as an idempotency key only stays stable across
+        a pause and resume if the snapshot records the value the live model generated.
+        """
+
+        class KeyedContext(BaseModel):
+            idempotency_key: str = Field(default_factory=lambda: uuid.uuid4().hex)
+            label: str = "run"
+
+        live_context = KeyedContext()
+        context = RunContextWrapper(context=live_context)
+        agent = Agent(name="AgentKeyed")
+        state = make_state(agent, context=context, original_input="input", max_turns=1)
+
+        json_data = state.to_json()
+        assert json_data["context"]["context"] == {
+            "idempotency_key": live_context.idempotency_key,
+            "label": "run",
+        }
+
+        new_state = await RunState.from_json(
+            agent,
+            json_data,
+            context_deserializer=KeyedContext.model_validate,
+        )
+        assert new_state._context is not None
+        restored = new_state._context.context
+        assert isinstance(restored, KeyedContext)
+        assert restored.idempotency_key == live_context.idempotency_key
+
+    @pytest.mark.asyncio
+    async def test_pydantic_context_to_string_handles_uuid_and_datetime(self):
+        """UUID and datetime context fields must serialize as JSON strings.
+
+        ``to_json`` promises a JSON-compatible dictionary, and ``to_string`` feeds that
+        dictionary to ``json.dumps``, so typed values must be converted when the context
+        model is dumped rather than left as Python objects.
+        """
+
+        class AuditContext(BaseModel):
+            request_id: uuid.UUID
+            started_at: datetime
+
+        live_context = AuditContext(
+            request_id=uuid.UUID(int=1),
+            started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        context = RunContextWrapper(context=live_context)
+        agent = Agent(name="AgentAudit")
+        state = make_state(agent, context=context, original_input="input", max_turns=1)
+
+        json_data = state.to_json()
+        assert json_data["context"]["context"] == {
+            "request_id": "00000000-0000-0000-0000-000000000001",
+            "started_at": "2026-01-01T00:00:00Z",
+        }
+
+        serialized = state.to_string()
+        new_state = await RunState.from_string(
+            agent,
+            serialized,
+            context_deserializer=AuditContext.model_validate,
+        )
+        assert new_state._context is not None
+        assert new_state._context.context == live_context
+
+    def test_pydantic_context_unserializable_value_keeps_python_dump_fallback(self):
+        """Values JSON mode cannot represent keep the previous serialization behavior.
+
+        A client object stored in a field with arbitrary types allowed makes the JSON
+        dump raise, so the serializer must fall back to the Python-mode dump instead of
+        failing or omitting the context.
+        """
+
+        class ClientHolder:
+            pass
+
+        class ClientContext(BaseModel):
+            model_config = ConfigDict(arbitrary_types_allowed=True)
+
+            client: Any = None
+            name: str = "holder"
+
+        client = ClientHolder()
+        live_context = ClientContext(client=client, name="primary")
+        context = RunContextWrapper(context=live_context)
+        agent = Agent(name="AgentClient")
+        state = make_state(agent, context=context, original_input="input", max_turns=1)
+
+        json_data = state.to_json()
+        payload = json_data["context"]["context"]
+        assert payload["client"] is client
+        assert payload["name"] == "primary"
+        assert json_data["context"]["context_meta"]["serialized_via"] == "model_dump"
 
     @pytest.mark.asyncio
     async def test_guardrail_results_round_trip(self):

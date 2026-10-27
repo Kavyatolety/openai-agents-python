@@ -1717,9 +1717,23 @@ class RunState(Generic[TContext, TAgent]):
 
         if hasattr(raw_context_payload, "model_dump"):
             try:
-                serialized = raw_context_payload.model_dump(exclude_unset=True)
-            except TypeError:
-                serialized = raw_context_payload.model_dump()
+                # Dump every field in JSON mode. ``exclude_unset`` drops fields that were
+                # never assigned, including defaults mutated in place during the run (such
+                # as an appended list or a field set on a defaulted nested model) and
+                # generated defaults such as idempotency keys, so a restored context would
+                # silently revert to fresh defaults. Python mode would also leave values
+                # such as UUID and datetime as objects that ``json.dumps`` cannot encode,
+                # even though ``to_json`` promises a JSON-compatible dictionary.
+                serialized = raw_context_payload.model_dump(mode="json")
+            except Exception:
+                # JSON mode cannot represent every value a model may hold, such as a
+                # client object kept in a field with arbitrary types allowed. Fall back
+                # to the previous Python-mode dump so those contexts serialize exactly
+                # as they did before.
+                try:
+                    serialized = raw_context_payload.model_dump(exclude_unset=True)
+                except TypeError:
+                    serialized = raw_context_payload.model_dump()
             if not isinstance(serialized, Mapping):
                 raise UserError("RunState context model_dump must return a mapping.")
             # We can persist the data, but the original type is lost unless the caller rebuilds it.
